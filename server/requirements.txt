@@ -1,0 +1,8 @@
+# free-chat server 依赖
+#
+# 只需要 g4f 本体：两个 server 都用 Python 标准库实现 HTTP 层
+# （http.server / ThreadingHTTPServer），不依赖 fastapi / uvicorn /
+# pydantic——后者在 aarch64 Android/Termux 上需要 Rust 编译。
+#
+# g4f 上游：https://github.com/xtekky/gpt4free （GPLv3）
+g4f>=8.7,<9

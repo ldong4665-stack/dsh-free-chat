@@ -1,0 +1,16 @@
+# dsh-free-chat bundle patch
+#
+# 把 free_chat 工具插进 DSH 的插件表：
+#   · id   —— 宿主半的加载器条目 id，与包名一致
+#   · name —— 包名，DSH 按此从 profile 的 node_modules 解析并加载 lib/index.js
+#
+# 安装链路：
+#   dsh plugin --profile web add <本地路径>
+#     → package.json 记录 file: 依赖 + dsh.profile.bundles 加入本包名
+#     → 引擎启动时应用本 patch，insert 一条 loader 条目
+#     → 解析到 dsh-free-chat/lib/index.js
+#     → apply(ctx) 执行 → ctx.tools.register(free_chat)
+#     → 模型在会话里看到 free_chat 工具
+- insert:
+    - id: dsh-free-chat
+      name: 'dsh-free-chat'

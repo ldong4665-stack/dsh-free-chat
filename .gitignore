@@ -1,0 +1,26 @@
+# 本机专用配置（容器名 / venv 路径 / Termux 前缀等），不进仓库
+scripts/local-env.sh
+
+# Python venv（install.sh 在仓库内创建的隔离环境）
+venv/
+
+# 服务运行日志
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# node
+node_modules/
+
+# 编辑器与系统文件
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# 本机遗留的旧部署产物
+start-services.sh

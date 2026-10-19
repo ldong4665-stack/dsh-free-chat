@@ -1,0 +1,36 @@
+{
+  "name": "dsh-free-chat",
+  "version": "1.0.0",
+  "description": "无账号免费 OpenAI 兼容聊统一入口：g4f (localhost:8080) 与 chat2api (localhost:8081) 两条通道，结构化错误，60 秒超时。",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "openai-compatible",
+    "gpt4free",
+    "g4f",
+    "chat2api",
+    "free",
+    "no-account",
+    "llm-adapter"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
