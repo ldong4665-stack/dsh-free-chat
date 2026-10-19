@@ -98,22 +98,27 @@ def extract_text(result):
     return str(result)
 
 
-def call_providers(model, messages, timeout_hint=55):
+def call_providers(model, messages, timeout_hint=55, tools=None):
     """依次尝试可用 provider，任一成功即返回 (text, provider_name)。
 
     全部失败时抛 RuntimeError，附上每个 provider 的错误摘要——这样上游调用方
     能拿到可读的失败原因，而不是空字符串。
+
+    tools：透传 OpenAI tools 声明。页面反代 provider 对 tools 的支持不稳定，
+    故交由插件层做「文本 → tool_calls」兜底解析（见插件 lib/parse_tool_calls.js）；
+    G4F_TOOL_EMULATION=1 时同时开启 g4f 内置仿真作为第一道。
     """
     errors = []
+    want_emulation = os.environ.get("G4F_TOOL_EMULATION", "").strip().lower() in ("1", "true", "yes", "on")
     for name, cls in provider_instances():
         try:
             LOG.info("try provider %s model=%s", name, model)
-            res = ChatCompletion.create(
-                model=model,
-                messages=messages,
-                provider=cls,
-                ignore_working=True,
-            )
+            kwargs = dict(model=model, messages=messages, provider=cls, ignore_working=True)
+            if tools:
+                kwargs["tools"] = tools
+                if want_emulation:
+                    kwargs["tool_emulation"] = True
+            res = ChatCompletion.create(**kwargs)
             text = extract_text(res)
             if text and text.strip():
                 LOG.info("provider %s ok (%d chars)", name, len(text))
@@ -174,8 +179,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         model = body.get("model") or "default"
+        tools = body.get("tools")
         try:
-            text, provider = call_providers(model, messages)
+            text, provider = call_providers(model, messages, tools=tools)
         except Exception as exc:  # noqa: BLE001 - 转成 HTTP 502，不崩服务
             LOG.error("completion failed: %s", exc)
             self._send(502, {
