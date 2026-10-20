@@ -111,6 +111,11 @@ class Handler(BaseHTTPRequestHandler):
         model = resolve_model(body.get("model"))
         upstream_payload = dict(body)
         upstream_payload["model"] = model
+        want_stream = bool(body.get("stream"))
+
+        if want_stream:
+            self._proxy_stream(upstream_payload, model)
+            return
 
         try:
             data = call_upstream(upstream_payload)
@@ -134,6 +139,44 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
         self._json(200, data)
+
+    def _proxy_stream(self, payload, model):
+        """把上游 SSE 原样转发给客户端（打字机效果）。
+
+        逐行读取上游流并立即 flush，不做缓冲、不做聚合——缓冲会让
+        「流式」退化成一次性输出，客户端看到的仍是整段蹦出来。
+        """
+        url = f"{G4F_BASE}/v1/chat/completions"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"content-type": "application/json", "accept": "text/event-stream"},
+            method="POST",
+        )
+
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream; charset=utf-8")
+        self.send_header("cache-control", "no-cache")
+        # 必须 close：发完就断开，否则客户端 reader 等不到流结束。
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                for raw in resp:
+                    if not raw:
+                        continue
+                    line = raw.decode("utf-8", "replace")
+                    # 把上游声明的模型名替换成免登录档实际落档的模型名。
+                    if '"model"' in line and model:
+                        line = re.sub(r'"model"\s*:\s*"[^"]*"', f'"model": "{model}"', line, count=1)
+                    self.wfile.write(line.encode("utf-8"))
+                    self.wfile.flush()
+        except BrokenPipeError:
+            log.info("stream client disconnected")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("stream proxy failed: %s", exc)
 
 
 if __name__ == "__main__":

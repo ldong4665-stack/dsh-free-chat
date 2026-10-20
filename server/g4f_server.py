@@ -98,6 +98,40 @@ def extract_text(result):
     return str(result)
 
 
+def split_for_stream(text, max_chars=12):
+    """把整段文本切成适合流式推送的小块。
+
+    切分规则偏「自然」：
+      - 换行单独成块（保住段落结构）
+      - 英文按空格边界切词（模型中文输出也常常混英文）
+      - 中文按字切（中文没有空格边界，按 max_chars 聚合）
+
+    目的只是让客户端看到打字节奏，不追求语义完美分块。
+    """
+    if not text:
+        return []
+
+    pieces = []
+    buf = ''
+    for ch in text:
+        buf += ch
+        if ch == '\n':
+            pieces.append(buf)
+            buf = ''
+        elif len(buf) >= max_chars:
+            # 优先在空格处断开，避免把英文单词劈成两半。
+            space_at = buf.rfind(' ')
+            if space_at > max_chars // 2:
+                pieces.append(buf[:space_at + 1])
+                buf = buf[space_at + 1:]
+            else:
+                pieces.append(buf)
+                buf = ''
+    if buf:
+        pieces.append(buf)
+    return pieces
+
+
 def call_providers(model, messages, timeout_hint=55, tools=None):
     """依次尝试可用 provider，任一成功即返回 (text, provider_name)。
 
@@ -180,6 +214,7 @@ class Handler(BaseHTTPRequestHandler):
 
         model = body.get("model") or "default"
         tools = body.get("tools")
+        want_stream = bool(body.get("stream"))
         try:
             text, provider = call_providers(model, messages, tools=tools)
         except Exception as exc:  # noqa: BLE001 - 转成 HTTP 502，不崩服务
@@ -191,6 +226,10 @@ class Handler(BaseHTTPRequestHandler):
                     "hint": "g4f 的可用性取决于当日活跃 Provider；稍后重试或切换 service。",
                 }
             })
+            return
+
+        if want_stream:
+            self._stream_text(model, provider, text)
             return
 
         self._send(200, {
@@ -206,6 +245,66 @@ class Handler(BaseHTTPRequestHandler):
             }],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
+
+    def _stream_text(self, model, provider, text):
+        """把已拿到的整段文本按块切成 SSE 流。
+
+        ⚠️ 这里必须真的发 `text/event-stream`：g4f 的 provider 调用本身是
+        阻塞的、拿不到增量（`ChatCompletion.create` 返回最终文本或生成器，
+        但网页反代 provider 多数只给最终结果）。所以本服务不做「边算边发」，
+        而是把结果按词切开、带上真实间隔逐条推出去——效果上就是打字机。
+
+        为什么不直接透传上游生成器：各 provider 的增量语义不统一（有的
+        给整段、有的给 token、有的返回 dict），透传会让调用方拿到混合格式。
+        在这里统一成标准 SSE，插件侧只需按标准解析。
+        """
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream; charset=utf-8")
+        self.send_header("cache-control", "no-cache")
+        # ⚠️ 必须声明 close：发完 [DONE] 要真的断开，否则客户端 reader
+        # 永远等不到 done（表现为「流打完了但一直转圈」）。不能发 keep-alive。
+        self.send_header("connection", "close")
+        self.send_header("x-accel-buffering", "no")
+        self.end_headers()
+        self.close_connection = True
+
+        chunk_id = f"chatcmpl-g4f-{int(time.time()*1000)}"
+        created = int(time.time())
+
+        def emit(delta, finish_reason=None):
+            payload = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "provider": provider,
+                "choices": [{
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason,
+                }],
+            }
+            line = "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+            self.wfile.write(line.encode("utf-8"))
+            self.wfile.flush()
+
+        try:
+            # 首个 chunk 只带 role，符合 OpenAI 流式约定。
+            emit({"role": "assistant", "content": ""})
+
+            for piece in split_for_stream(text):
+                emit({"content": piece})
+                # 小块之间留一点间隔，客户端才能看出打字节奏。
+                time.sleep(0.02)
+
+            emit({}, "stop")
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except BrokenPipeError:
+            # 客户端中途断开（用户点了停止），不算错误。
+            LOG.info("stream client disconnected")
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("stream failed: %s", exc)
 
 
 if __name__ == "__main__":
