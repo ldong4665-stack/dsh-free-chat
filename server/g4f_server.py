@@ -59,11 +59,15 @@ PREFERRED_PROVIDERS = [
 ]
 
 
-def provider_instances():
+def provider_instances(prefer_stream=False):
     """把 provider 名解析成类；解析不到的跳过（版本差异不致命）。
 
     ⚠️ `g4f.Provider.__providers__` 是**类的 list**，不是 dict——按名字查表
     会 AttributeError。这里先建 name→class 映射。
+
+    prefer_stream=True 时，把 `supports_stream` 的 provider 排到前面。
+    原因：部分 provider（如 Yqcloud）会接受 stream=True 却只吐一整个块，
+    导致「真流式」退化成一次性输出；先试真支持增量的，打字机才成立。
     """
     by_name = {}
     for item in ALL_PROVIDERS:
@@ -75,6 +79,13 @@ def provider_instances():
         cls = by_name.get(name)
         if cls is not None:
             out.append((name, cls))
+
+    if prefer_stream and len(out) > 1:
+        def rank(entry):
+            supports = bool(getattr(entry[1], "supports_stream", False))
+            return (0 if supports else 1)
+
+        out.sort(key=rank)
     return out
 
 
@@ -100,6 +111,11 @@ def extract_text(result):
 
 def split_for_stream(text, max_chars=12):
     """把整段文本切成适合流式推送的小块。
+
+    ⚠️ 这是**降级路径**：只有当上游 provider 不支持真流式、只肯返回整段
+    文本时才会用到。真流式请走 iter_providers_stream()——那才是边算边发。
+    早期误把这里当成主路径（先拿完整结果再切块），结果是「等 5 秒、
+    内容在最后几百毫秒一次性涌出」，用户看到的仍是一次性吐出。
 
     切分规则偏「自然」：
       - 换行单独成块（保住段落结构）
@@ -130,6 +146,133 @@ def split_for_stream(text, max_chars=12):
     if buf:
         pieces.append(buf)
     return pieces
+
+
+def extract_stream_piece(piece):
+    """从 g4f 的单个流式增量里抽出文本。
+
+    各 provider 的增量形态不统一：纯字符串、`{"content": ...}`、
+    `{"choices":[{"delta":{"content":...}}]}` 都见过。统一成字符串，
+    抽不出来就返回空串（调用方跳过）。
+    """
+    if isinstance(piece, str):
+        return piece
+    if isinstance(piece, dict):
+        # 标准 OpenAI delta
+        try:
+            delta = piece["choices"][0]["delta"]
+            content = delta.get("content")
+            if isinstance(content, str):
+                return content
+        except Exception:
+            pass
+        # g4f 简化形态
+        content = piece.get("content")
+        if isinstance(content, str):
+            return content
+        return ""
+    return ""
+
+
+def iter_providers_stream(model, messages, timeout_hint=55, tools=None):
+    """逐个 provider 尝试真流式，边收增量边 yield (piece, provider_name)。
+
+    与 call_providers 的区别：这里**不**等生成结束，yield 是实时的——
+    这正是打字机效果的前提。
+
+    若某 provider 不支持 stream（StreamNotSupportedError）或首块就失败，
+    换下一个；一旦已产出内容就不再换（避免半截话拼接）。
+    """
+    errors = []
+    # 假流式兜底：某个 provider 给了内容但只有单块时暂存于此，
+    # 等所有 provider 都试完还没有真增量，再退回去用它。
+    state = {"fake": None}
+    want_emulation = os.environ.get("G4F_TOOL_EMULATION", "").strip().lower() in ("1", "true", "yes", "on")
+
+    # 工具调用场景走非流式：tool_emulation 需要完整文本才能解析，
+    # 而我们的插件层本来就等流结束后统一解析，这里不必真流。
+    if tools:
+        text, name = call_providers(model, messages, tools=tools)
+        yield text, name
+        return
+
+    for name, cls in provider_instances(prefer_stream=True):
+        started = False
+        try:
+            LOG.info("stream try provider %s model=%s", name, model)
+            res = ChatCompletion.create(
+                model=model,
+                messages=messages,
+                provider=cls,
+                ignore_working=True,
+                stream=True,
+            )
+
+            # 非生成器（provider 忽略了 stream）：直接吐出整段。
+            if isinstance(res, (str, dict)):
+                text = extract_text(res)
+                if text and text.strip():
+                    LOG.info("stream provider %s returned non-stream (%d chars)", name, len(text))
+                    yield text, name
+                    return
+                errors.append(f"{name}: empty result")
+                continue
+
+            # ⚠️ 先探测再转发：有些 provider（实测 Yqcloud）会接受 stream=True
+            # 却只吐出**一整块**正文。若能收到 ≥2 个块才算真增量，否则换下一个。
+            # 必须先在本地缓冲两块，确认后才开始 yield——已经发出去的 chunk
+            # 收不回来，会让用户看到「半段 + 重来」的拼接内容。
+            buffer = []
+            iterator = iter(res)
+            for piece in iterator:
+                piece_text = extract_stream_piece(piece)
+                if not piece_text:
+                    continue
+                buffer.append(piece_text)
+                if len(buffer) >= 2:
+                    break
+
+            if len(buffer) >= 2:
+                # 真流式：先补发前两块，然后继续透传剩余增量。
+                started = True
+                LOG.info("stream provider %s first token (real stream)", name)
+                for piece_text in buffer:
+                    yield piece_text, name
+                buffer = []
+                for piece in iterator:
+                    piece_text = extract_stream_piece(piece)
+                    if piece_text:
+                        yield piece_text, name
+                LOG.info("stream provider %s ok (real stream)", name)
+                return
+
+            if len(buffer) == 1:
+                # 单块 = 假流式。内容是对的，但拿不到打字节奏；
+                # 记下来当**兜底**，继续试下一个 provider 看有没有真增量。
+                fake = ("".join(buffer), name)
+                errors.append(f"{name}: single chunk (no real streaming)")
+                LOG.info("stream provider %s only produced 1 chunk, trying next", name)
+                if state.get("fake") is None:
+                    state["fake"] = fake
+                continue
+
+            errors.append(f"{name}: empty stream")
+        except Exception as exc:  # noqa: BLE001
+            # 已经开始吐字就不能再换 provider，否则用户会看到两段拼接的内容。
+            if started:
+                LOG.warning("stream provider %s broke mid-way: %s", name, str(exc)[:160])
+                return
+            msg = f"{type(exc).__name__}: {str(exc)[:160]}"
+            errors.append(f"{name}: {msg}")
+            LOG.warning("stream provider %s failed: %s", name, msg)
+
+    # 所有 provider 都没给出真增量：退回单块结果（内容正确，只是没有打字节奏）。
+    if state.get("fake") is not None:
+        LOG.info("no provider gave real stream, falling back to single chunk text")
+        yield state["fake"]
+        return
+
+    raise RuntimeError("all providers failed (stream) | " + " ; ".join(errors))
 
 
 def call_providers(model, messages, timeout_hint=55, tools=None):
@@ -215,6 +358,14 @@ class Handler(BaseHTTPRequestHandler):
         model = body.get("model") or "default"
         tools = body.get("tools")
         want_stream = bool(body.get("stream"))
+
+        # ⚠️ 流式必须走独立路径：不能先 call_providers() 拿到完整文本再切块，
+        # 那样首字节要等整个生成结束（实测 5.5 秒），内容集中在最后
+        # 268ms 涌出——用户看到的就是「一次性吐出」，和没做流式一样。
+        if want_stream:
+            self._stream_upstream(model, messages, tools)
+            return
+
         try:
             text, provider = call_providers(model, messages, tools=tools)
         except Exception as exc:  # noqa: BLE001 - 转成 HTTP 502，不崩服务
@@ -226,10 +377,6 @@ class Handler(BaseHTTPRequestHandler):
                     "hint": "g4f 的可用性取决于当日活跃 Provider；稍后重试或切换 service。",
                 }
             })
-            return
-
-        if want_stream:
-            self._stream_text(model, provider, text)
             return
 
         self._send(200, {
@@ -246,22 +393,22 @@ class Handler(BaseHTTPRequestHandler):
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
 
-    def _stream_text(self, model, provider, text):
-        """把已拿到的整段文本按块切成 SSE 流。
+    def _stream_upstream(self, model, messages, tools):
+        """真流式：边从上游取增量、边 flush 给客户端。
 
-        ⚠️ 这里必须真的发 `text/event-stream`：g4f 的 provider 调用本身是
-        阻塞的、拿不到增量（`ChatCompletion.create` 返回最终文本或生成器，
-        但网页反代 provider 多数只给最终结果）。所以本服务不做「边算边发」，
-        而是把结果按词切开、带上真实间隔逐条推出去——效果上就是打字机。
+        两条路径：
+          1. **真流式**（首选）—— `ChatCompletion.create(stream=True)` 返回
+             生成器，逐个 delta 转发。首字节延迟 = provider 的首 token 时间。
+          2. **降级**（provider 不支持 stream 时）—— 退回整段生成 + 切块推送。
+             这条路上首字节会明显变慢，但至少结构仍是 SSE。
 
-        为什么不直接透传上游生成器：各 provider 的增量语义不统一（有的
-        给整段、有的给 token、有的返回 dict），透传会让调用方拿到混合格式。
-        在这里统一成标准 SSE，插件侧只需按标准解析。
+        早期只实现了路径 2，实测首块要等 5.5 秒、内容集中在最后 268ms，
+        用户看到的就是「一次性吐出」。真正的打字机必须走路径 1。
         """
         self.send_response(200)
         self.send_header("content-type", "text/event-stream; charset=utf-8")
         self.send_header("cache-control", "no-cache")
-        # ⚠️ 必须声明 close：发完 [DONE] 要真的断开，否则客户端 reader
+        # ⚠️ 必须 close：发完 [DONE] 要真的断开，否则客户端 reader
         # 永远等不到 done（表现为「流打完了但一直转圈」）。不能发 keep-alive。
         self.send_header("connection", "close")
         self.send_header("x-accel-buffering", "no")
@@ -270,6 +417,7 @@ class Handler(BaseHTTPRequestHandler):
 
         chunk_id = f"chatcmpl-g4f-{int(time.time()*1000)}"
         created = int(time.time())
+        state = {"provider": None}
 
         def emit(delta, finish_reason=None):
             payload = {
@@ -277,7 +425,7 @@ class Handler(BaseHTTPRequestHandler):
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
-                "provider": provider,
+                "provider": state["provider"] or "",
                 "choices": [{
                     "index": 0,
                     "delta": delta,
@@ -292,10 +440,22 @@ class Handler(BaseHTTPRequestHandler):
             # 首个 chunk 只带 role，符合 OpenAI 流式约定。
             emit({"role": "assistant", "content": ""})
 
-            for piece in split_for_stream(text):
+            produced = False
+            for piece, provider in iter_providers_stream(model, messages, tools=tools):
+                if state["provider"] is None:
+                    state["provider"] = provider
+                if not piece:
+                    continue
+                produced = True
                 emit({"content": piece})
-                # 小块之间留一点间隔，客户端才能看出打字节奏。
-                time.sleep(0.02)
+
+            if not produced:
+                # 上游一个字都没吐：退化成整段路径，避免用户拿到空回复。
+                LOG.warning("stream produced nothing, falling back to full generation")
+                text, provider = call_providers(model, messages, tools=tools)
+                state["provider"] = provider
+                for piece in split_for_stream(text):
+                    emit({"content": piece})
 
             emit({}, "stop")
             self.wfile.write(b"data: [DONE]\n\n")
